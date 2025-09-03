@@ -1,116 +1,108 @@
-# app.py
+
 import streamlit as st
-import os, tempfile
-from io import BytesIO
-
-# PDF & Word parsing
-from PyPDF2 import PdfReader
-import docx
-
-# LangChain & embeddings
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Chroma
-from langchain.text_splitter import CharacterTextSplitter
-from langchain.docstore.document import Document
-from langchain.llms import HuggingFacePipeline
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import HuggingFacePipeline
 from langchain.chains import RetrievalQA
+from langchain.chains.summarize import load_summarize_chain  # ✅ fixed import
+from transformers import pipeline
 
-# Hugging Face model pipeline
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+# ------------------------------
+# Streamlit App Config
+# ------------------------------
+st.set_page_config(page_title="ManGPT", page_icon="🤖", layout="wide")
+st.title("🤖 ManGPT – Document Q&A & Summarization")
+st.markdown("Upload PDFs or Word documents, then **ask questions** or get a **summary**.")
 
-# --------------------
-# Config
-# --------------------
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-GENERATOR_MODEL = "google/flan-t5-small"
-CHROMA_PERSIST_DIR = "chroma_man_gpt_db"
-os.makedirs(CHROMA_PERSIST_DIR, exist_ok=True)
+# ------------------------------
+# Initialize Session State Safely
+# ------------------------------
+if "vectordb" not in st.session_state:
+    st.session_state["vectordb"] = None
 
-# --------------------
-# File parsing helpers
-# --------------------
-def read_pdf(file_bytes: BytesIO) -> str:
-    reader = PdfReader(file_bytes)
-    return "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
-
-def read_docx(file_bytes: BytesIO) -> str:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-        tmp.write(file_bytes.read()); tmp.flush()
-        doc = docx.Document(tmp.name)
-    os.remove(tmp.name)
-    return "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-
-def load_file(uploaded_file):
-    name = uploaded_file.name.lower()
-    if name.endswith(".pdf"):
-        return read_pdf(uploaded_file)
-    elif name.endswith(".docx") or name.endswith(".doc"):
-        uploaded_file.seek(0); return read_docx(uploaded_file)
+# ------------------------------
+# Load Document Function
+# ------------------------------
+def load_document(file):
+    """Load PDF or Word document and return text."""
+    if file.type == "application/pdf":
+        loader = PyPDFLoader(file.name)
+    elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        loader = Docx2txtLoader(file.name)
     else:
-        return uploaded_file.getvalue().decode("utf-8", errors="ignore")
+        st.error("❌ Unsupported file type. Please upload PDF or Word.")
+        return None
+    return loader.load()
 
-# --------------------
-# Models
-# --------------------
-@st.cache_resource
-def get_embedding_model():
-    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+# ------------------------------
+# Split Text Function
+# ------------------------------
+def split_text(docs):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    return splitter.split_documents(docs)
 
-@st.cache_resource
-def get_generation_pipeline():
-    tokenizer = AutoTokenizer.from_pretrained(GENERATOR_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(GENERATOR_MODEL)
-    hf_pipe = pipeline("text2text-generation", model=model, tokenizer=tokenizer, device=-1)
-    return HuggingFacePipeline(pipeline=hf_pipe)
+# ------------------------------
+# Create FAISS VectorDB
+# ------------------------------
+def create_vectordb(texts, metadatas=None):
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return FAISS.from_documents(texts, embeddings)
 
-def split_text(text, chunk_size=1000, chunk_overlap=200):
-    splitter = CharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    return splitter.split_text(text)
+# ------------------------------
+# LLM Setup (CPU-friendly)
+# ------------------------------
+def load_llm():
+    gen_pipeline = pipeline(
+        "text2text-generation",
+        model="google/flan-t5-small",  # lightweight & HF-friendly
+        tokenizer="google/flan-t5-small",
+        max_length=512
+    )
+    return HuggingFacePipeline(pipeline=gen_pipeline)
 
-def create_vectordb(texts, metadatas):
-    emb = get_embedding_model()
-    docs = [Document(page_content=t, metadata=m) for t, m in zip(texts, metadatas)]
-    vectordb = Chroma.from_documents(docs, emb, persist_directory=CHROMA_PERSIST_DIR)
-    vectordb.persist()
-    return vectordb
+llm = load_llm()
 
-# --------------------
-# Streamlit UI
-# --------------------
-def main():
-    st.title("📘 ManGPT — Document Q&A")
-    st.markdown("Upload a PDF or Word document, index it, and ask questions.")
+# ------------------------------
+# File Uploader
+# ------------------------------
+uploaded = st.file_uploader("📤 Upload a PDF or Word document", type=["pdf", "docx"])
 
-    uploaded = st.file_uploader("Upload a PDF or Word (.docx)", type=["pdf", "docx"])
-    if "vectordb" not in st.session_state: st.session_state.vectordb = None
+if uploaded:
+    with open(uploaded.name, "wb") as f:
+        f.write(uploaded.getbuffer())
+    docs = load_document(uploaded)
 
-    if uploaded:
-        raw_text = load_file(uploaded)
-        st.info(f"Extracted {len(raw_text)} characters from document")
-        texts = split_text(raw_text)
-        metadatas = [{"source": uploaded.name, "chunk": i} for i in range(len(texts))]
+    if docs:
+        texts = split_text(docs)
 
-        if st.button("Index document"):
-            st.session_state.vectordb = create_vectordb(texts, metadatas)
-            st.success("Document indexed!")
+        if st.button("📥 Index Document"):
+            st.session_state["vectordb"] = create_vectordb(texts)
+            st.success("✅ Document indexed successfully!")
 
-    if st.session_state.vectordb:
-        q = st.text_input("Ask a question about your document")
-        if st.button("Get Answer"):
-            retriever = st.session_state.vectordb.as_retriever(search_kwargs={"k": 4})
-            llm = get_generation_pipeline()
-            qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
-            result = qa_chain({"query": q})
-            st.write("**Answer:**", result["result"])
+# ------------------------------
+# Q&A Section
+# ------------------------------
+if st.session_state.get("vectordb") is not None:
+    q = st.text_input("💬 Ask a question about your document:")
 
-        if st.button("Summarize Document"):
-            retriever = st.session_state.vectordb.as_retriever(search_kwargs={"k": 6})
-            docs = retriever.get_relevant_documents("summarize this document")
-            combined = "\n".join([d.page_content for d in docs])
-            prompt = f"Summarize this:\n\n{combined}"
-            llm = get_generation_pipeline()
-            summary = llm(prompt)
-            st.write("**Summary:**", summary)
+    if st.button("🔍 Get Answer") and q.strip():
+        retriever = st.session_state["vectordb"].as_retriever(search_kwargs={"k": 4})
+        qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, return_source_documents=True)
+        result = qa_chain.invoke(q)
 
-if __name__ == "__main__":
-    main()
+        st.subheader("Answer:")
+        st.write(result["result"])
+
+# ------------------------------
+# Summarization Section
+# ------------------------------
+if st.session_state.get("vectordb") is not None:
+    if st.button("📝 Summarize Document"):
+        docs = st.session_state["vectordb"].docstore.search("")
+        chain = load_summarize_chain(llm, chain_type="map_reduce")
+        summary = chain.run(docs)
+
+        st.subheader("Summary:")
+        st.write(summary)
